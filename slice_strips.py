@@ -7,14 +7,15 @@
 # ///
 
 """
-slice_strips.py — 35mm film strip frame slicer
+slice_strips.py — film strip frame slicer (35mm and 120 medium format)
 
-Detects inter-frame gaps in scanned film strips, crops out sprocket holes,
-and exports each frame as an individual TIFF file.
+Detects inter-frame gaps in scanned film strips, crops out sprocket holes
+(35mm only), and exports each frame as an individual TIFF file.
 
 Usage:
     python slice_strips.py INPUT_FOLDER [options]
     python slice_strips.py INPUT_FOLDER --dry-run -v
+    python slice_strips.py INPUT_FOLDER --format 120 --dry-run -v
 """
 
 import argparse
@@ -95,7 +96,7 @@ class ProcessingResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Slice scanned 35mm film strips into individual frame TIFFs.",
+        description="Slice scanned film strips into individual frame TIFFs (35mm and 120 medium format).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -147,6 +148,12 @@ Examples:
         metavar="INT",
         help="Pixels to trim from the top and bottom of every exported frame "
              "to remove the film rebate. Default: 0.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["35mm", "120"],
+        default="35mm",
+        help="Film format. '120' disables sprocket detection and uses full-width row means. Default: 35mm.",
     )
     parser.add_argument(
         "--no-crop-sprockets",
@@ -589,7 +596,8 @@ def process_file(
         print(f"  [DEBUG] {filepath.name}: {W}x{H}px, "
               f"brightness=[{gray.min():.1f}, {gray.max():.1f}]")
 
-    row_means = compute_row_means(gray, trim_fraction=GEOMETRIC_TRIM_FRACTION)
+    trim = 0.0 if args.format == "120" else GEOMETRIC_TRIM_FRACTION
+    row_means = compute_row_means(gray, trim_fraction=trim)
 
     threshold = (float(args.threshold) if args.threshold is not None
                  else auto_threshold(row_means))
@@ -622,7 +630,8 @@ def process_file(
         )
         return result
 
-    crop_box = detect_sprocket_crop(gray, gaps, args.no_crop_sprockets, args.verbose)
+    no_crop = args.no_crop_sprockets or (args.format == "120")
+    crop_box = detect_sprocket_crop(gray, gaps, no_crop, args.verbose)
     result.crop_box = crop_box
     result.frames = frames
     result.n_frames = len(frames)
