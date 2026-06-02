@@ -1,0 +1,5 @@
+.claude/
+__pycache__/
+output/
+scans/*
+!scans/.gitkeep
