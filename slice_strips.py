@@ -7,15 +7,16 @@
 # ///
 
 """
-slice_strips.py — film strip frame slicer (35mm and 120 medium format)
+slice_strips.py — film strip frame slicer
 
-Detects inter-frame gaps in scanned film strips, crops out sprocket holes
-(35mm only), and exports each frame as an individual TIFF file.
+Detects inter-frame gaps in scanned film strips and exports each frame as
+an individual TIFF file.  Designed for use with film holders (sprocket holes
+are never visible in the scan).
 
 Usage:
     python slice_strips.py INPUT_FOLDER [options]
     python slice_strips.py INPUT_FOLDER --dry-run -v
-    python slice_strips.py INPUT_FOLDER --format 120 --dry-run -v
+    python slice_strips.py INPUT_FOLDER --threshold 36 --dry-run -v
 """
 
 import argparse
@@ -27,17 +28,23 @@ from typing import List, Optional
 import numpy as np
 from PIL import Image, ImageDraw
 
+Image.MAX_IMAGE_PIXELS = None   # scans legitimately exceed Pillow's decompression-bomb guard
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 DEFAULT_MIN_GAP_PX = 10
-DEFAULT_MIN_FRAME_PX = 200
+DEFAULT_MIN_FRAME_PX = 600
 DEFAULT_EXTENSIONS = ["tif", "tiff", "jpg", "jpeg", "png"]
-DEFAULT_SPROCKET_MARGIN_PX = 5
-SPROCKET_BRIGHTNESS_RATIO = 0.7   # fraction of gap-region max to detect holes
-GEOMETRIC_TRIM_FRACTION = 0.10    # fallback: trim this fraction from each side
-DEFAULT_GAP_THRESHOLD = 36       # max auto-threshold for center-trimmed row means
+DEFAULT_GAP_THRESHOLD = 8       # max auto-threshold: real inter-frame borders are near-black (<10)
+                                 # keeping this tight avoids misclassifying dark frame content as gaps
+EDGE_TRIM_FRACTION = 0.155       # trim this fraction from each column edge before computing row means;
+                                 # excludes bright holder/film-edge artefacts that skew gap detection
+
+HOLDER_BRIGHTNESS = 240   # rows at or above this mean are considered empty holder material
+HOLDER_STD = 10           # rows below this std are too uniform to be real film content
+HOLDER_SCAN_WINDOW = 10   # sliding-window size for the inward holder scan
 
 CONTACT_THUMB_HEIGHT = 300   # px — thumbnail height in the contact sheet
 CONTACT_PADDING = 8          # px — gap between thumbnails and edges
@@ -96,14 +103,14 @@ class ProcessingResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Slice scanned film strips into individual frame TIFFs (35mm and 120 medium format).",
+        description="Slice scanned film strips into individual frame TIFFs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python slice_strips.py ~/scans/
   python slice_strips.py ~/scans/ --dry-run -v
-  python slice_strips.py ~/scans/ --threshold 40 --min-frame 300
-  python slice_strips.py ~/scans/ --output ~/frames/ --no-crop-sprockets
+  python slice_strips.py ~/scans/ --threshold 36 --max-gap 750
+  python slice_strips.py ~/scans/ --output ~/frames/
 """,
     )
     parser.add_argument(
@@ -122,8 +129,9 @@ Examples:
         type=int,
         default=None,
         metavar="INT",
-        help="Gap darkness threshold 0-255. Rows darker than this are gaps. "
-             "Default: auto-detected via 1-D Otsu on row brightness distribution.",
+        help="Gap darkness threshold 0-255. Rows with brightness below this are gaps. "
+             "Default: auto-detected via 1-D Otsu, capped at 12. "
+             "Increase to 36 if too few frames are detected (film base brighter than default cap).",
     )
     parser.add_argument(
         "--min-gap",
@@ -132,6 +140,16 @@ Examples:
         metavar="INT",
         help=f"Minimum gap height in pixels to be considered a real gap. "
              f"Default: {DEFAULT_MIN_GAP_PX}.",
+    )
+    parser.add_argument(
+        "--max-gap",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Maximum gap height in pixels. Gaps taller than this are discarded. "
+             "Useful with --threshold 36 to remove large false gaps caused by very "
+             "dark frame content. Default: disabled (no upper limit). "
+             "Suggested value for dark rolls: 750.",
     )
     parser.add_argument(
         "--min-frame",
@@ -150,23 +168,18 @@ Examples:
              "to remove the film rebate. Default: 0.",
     )
     parser.add_argument(
-        "--format",
-        choices=["35mm", "120"],
-        default="35mm",
-        help="Film format. '120' disables sprocket detection and uses full-width row means. Default: 35mm.",
-    )
-    parser.add_argument(
-        "--no-crop-sprockets",
-        action="store_true",
-        help="Skip sprocket-hole detection; export the full strip width.",
-    )
-    parser.add_argument(
         "--extensions",
         type=str,
         default=",".join(DEFAULT_EXTENSIONS),
         metavar="EXTS",
         help=f"Comma-separated file extensions to process. "
              f"Default: {','.join(DEFAULT_EXTENSIONS)}.",
+    )
+    parser.add_argument(
+        "--no-holder-trim",
+        action="store_true",
+        help="Disable automatic trimming of bright film-holder areas at the "
+             "leading and trailing edges of each scan. On by default.",
     )
     parser.add_argument(
         "--dry-run",
@@ -222,6 +235,13 @@ def collect_input_files(folder: Path, extensions: List[str], output_dir: Path) -
 def load_image_cv(filepath: Path) -> np.ndarray:
     """Load image as float32 grayscale in [0, 255] range for analysis."""
     pil_img = Image.open(filepath)
+
+    # Normalise mode so np.array always yields a 2-D (H×W) array
+    if pil_img.mode in ('I;16', 'I;16B'):
+        pil_img = pil_img.convert('I')   # raw 16-bit (any endian) → 32-bit signed int
+    elif pil_img.mode not in ('L', 'I', 'F'):
+        pil_img = pil_img.convert('L')   # RGB/RGBA/etc. → 8-bit grayscale
+
     img = np.array(pil_img, dtype=np.float32)
 
     # Normalise 16-bit to [0, 255] so --threshold values are always in 0-255 range
@@ -249,6 +269,17 @@ def compute_row_means(gray: np.ndarray, trim_fraction: float = 0.0) -> np.ndarra
         if x1 > x0:
             return gray[:, x0:x1].mean(axis=1)
     return gray.mean(axis=1)
+
+
+def compute_row_stds(gray: np.ndarray, trim_fraction: float = 0.0) -> np.ndarray:
+    """Std deviation per row, shape (H,). Same column trimming as compute_row_means."""
+    if trim_fraction > 0:
+        W = gray.shape[1]
+        x0 = int(W * trim_fraction)
+        x1 = W - x0
+        if x1 > x0:
+            return gray[:, x0:x1].std(axis=1)
+    return gray.std(axis=1)
 
 
 def auto_threshold(row_means: np.ndarray) -> float:
@@ -320,6 +351,7 @@ def detect_gaps(
     row_means: np.ndarray,
     threshold: float,
     min_gap_px: int,
+    max_gap_px: Optional[int] = None,
 ) -> List[GapRegion]:
     """Find inter-frame gaps; refine wide gaps caused by dark photographic content."""
     gaps = _find_gap_runs(row_means, threshold, min_gap_px)
@@ -340,6 +372,10 @@ def detect_gaps(
                 refined.append(GapRegion(gap.y_start + sg.y_start, gap.y_start + sg.y_end))
         else:
             refined.append(gap)
+
+    # Discard gaps that exceed the user-specified maximum height.
+    if max_gap_px is not None:
+        refined = [g for g in refined if g.height <= max_gap_px]
 
     # Remove a large trailing gap that would abnormally truncate the last frame.
     # "Trailing" = no frame-sized content follows. "Abnormal" = last frame < 80% of typical.
@@ -406,91 +442,75 @@ def gaps_to_frames(
     return frames
 
 
-# ---------------------------------------------------------------------------
-# Sprocket-hole detection
-# ---------------------------------------------------------------------------
+def _is_holder_window(
+    row_means: np.ndarray,
+    row_stds: np.ndarray,
+    y: int,
+    window: int,
+    brightness: float,
+    std_thresh: float,
+) -> bool:
+    """Return True if every row in [y, y+window) looks like empty holder material."""
+    end = min(y + window, len(row_means))
+    return bool(
+        np.all(row_means[y:end] >= brightness) and np.all(row_stds[y:end] < std_thresh)
+    )
 
-def detect_sprocket_crop(
-    gray: np.ndarray,
-    gaps: List[GapRegion],
-    no_crop: bool,
-    verbose: bool,
-    margin: int = DEFAULT_SPROCKET_MARGIN_PX,
-) -> CropBox:
+
+def trim_holder_edges(
+    frames: List[FrameRegion],
+    row_means: np.ndarray,
+    row_stds: np.ndarray,
+    min_frame_px: int,
+    brightness: float = HOLDER_BRIGHTNESS,
+    std_thresh: float = HOLDER_STD,
+    window: int = HOLDER_SCAN_WINDOW,
+) -> List[FrameRegion]:
     """
-    Determine left/right image-area bounds by detecting sprocket holes in a gap
-    region. Falls back to geometric crop if detection fails.
+    Trim uniformly bright film-holder material from the outer edges of the
+    leading and trailing frames.  A row is considered holder material when its
+    mean brightness ≥ `brightness` AND its std deviation < `std_thresh`.
+    Scans inward using a sliding window so a single noisy row doesn't
+    prematurely stop the trim.  Frames that become smaller than `min_frame_px`
+    after trimming are dropped entirely.
     """
-    W = gray.shape[1]
+    if not frames:
+        return frames
 
-    if no_crop:
-        return CropBox(x_left=0, x_right=W, method="full")
+    result = list(frames)
 
-    def geometric_fallback() -> CropBox:
-        x_left = int(W * GEOMETRIC_TRIM_FRACTION)
-        x_right = W - x_left
-        if verbose:
-            print(f"  [DEBUG] Sprocket crop: geometric fallback "
-                  f"({GEOMETRIC_TRIM_FRACTION*100:.0f}% trim each side), "
-                  f"x=[{x_left}:{x_right}]")
-        return CropBox(x_left=x_left, x_right=x_right, method="geometric")
+    # --- Trim the leading edge of the first frame ---
+    first = result[0]
+    new_start = first.y_start
+    y = first.y_start
+    while y < first.y_end and _is_holder_window(row_means, row_stds, y, window, brightness, std_thresh):
+        new_start = y + window
+        y += window
+    if new_start != first.y_start:
+        trimmed = FrameRegion(y_start=new_start, y_end=first.y_end, index=first.index)
+        if trimmed.height >= min_frame_px:
+            result[0] = trimmed
+        else:
+            result = result[1:]
 
-    if not gaps:
-        return geometric_fallback()
+    if not result:
+        return result
 
-    # Try gaps starting from the middle, expanding outward
-    mid = len(gaps) // 2
-    order = [mid]
-    for step in range(1, len(gaps)):
-        for d in (step, -step):
-            idx = mid + d
-            if 0 <= idx < len(gaps) and idx not in order:
-                order.append(idx)
+    # --- Trim the trailing edge of the last frame ---
+    last = result[-1]
+    new_end = last.y_end
+    y = last.y_end - window + 1
+    while y > last.y_start and _is_holder_window(row_means, row_stds, y, window, brightness, std_thresh):
+        new_end = y - 1
+        y -= window
+    if new_end != last.y_end:
+        trimmed = FrameRegion(y_start=last.y_start, y_end=new_end, index=last.index)
+        if trimmed.height >= min_frame_px:
+            result[-1] = trimmed
+        else:
+            result = result[:-1]
 
-    for gi in order:
-        gap = gaps[gi]
-        if gap.height < 3:
-            continue
-
-        gap_strip = gray[gap.y_start: gap.y_end + 1, :]
-        col_profile = gap_strip.mean(axis=0)
-        profile_max = float(col_profile.max())
-        if profile_max == 0:
-            continue
-
-        sprocket_thresh = SPROCKET_BRIGHTNESS_RATIO * profile_max
-
-        left_zone = col_profile[: W // 3]
-        left_hits = np.where(left_zone > sprocket_thresh)[0]
-
-        right_start = 2 * W // 3
-        right_zone = col_profile[right_start:]
-        right_hits = np.where(right_zone > sprocket_thresh)[0]
-
-        if left_hits.size == 0 or right_hits.size == 0:
-            if verbose:
-                print(f"  [DEBUG] Gap {gi}: no sprocket candidates "
-                      f"(left={left_hits.size}, right={right_hits.size}), trying next")
-            continue
-
-        left_edge = int(left_hits.max())
-        right_edge = int(right_hits.min()) + right_start
-
-        x_left = left_edge + 1 + margin
-        x_right = right_edge - margin
-
-        if x_left >= x_right or x_left < 0 or x_right > W:
-            if verbose:
-                print(f"  [DEBUG] Gap {gi}: invalid crop box "
-                      f"x_left={x_left}, x_right={x_right}, trying next")
-            continue
-
-        if verbose:
-            print(f"  [DEBUG] Sprocket crop: method=sprocket via gap {gi} "
-                  f"(y=[{gap.y_start}:{gap.y_end}]), x=[{x_left}:{x_right}]")
-        return CropBox(x_left=x_left, x_right=x_right, method="sprocket")
-
-    return geometric_fallback()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +567,7 @@ def generate_contact_sheet(
 
         ratio = CONTACT_THUMB_HEIGHT / cropped.height
         thumb_w = max(1, int(cropped.width * ratio))
-        thumbs.append(cropped.resize((thumb_w, CONTACT_THUMB_HEIGHT), Image.LANCZOS))
+        thumbs.append(cropped.resize((thumb_w, CONTACT_THUMB_HEIGHT), Image.Resampling.LANCZOS))
 
     pad = CONTACT_PADDING
     total_w = sum(t.width + 2 for t in thumbs) + pad * (len(thumbs) + 1)
@@ -596,8 +616,7 @@ def process_file(
         print(f"  [DEBUG] {filepath.name}: {W}x{H}px, "
               f"brightness=[{gray.min():.1f}, {gray.max():.1f}]")
 
-    trim = 0.0 if args.format == "120" else GEOMETRIC_TRIM_FRACTION
-    row_means = compute_row_means(gray, trim_fraction=trim)
+    row_means = compute_row_means(gray, trim_fraction=EDGE_TRIM_FRACTION)
 
     threshold = (float(args.threshold) if args.threshold is not None
                  else auto_threshold(row_means))
@@ -609,7 +628,7 @@ def process_file(
               f"max={row_means.max():.1f}, mean={row_means.mean():.1f}")
         print(f"  [DEBUG] Threshold: {threshold:.1f} ({src})")
 
-    gaps = detect_gaps(row_means, threshold, args.min_gap)
+    gaps = detect_gaps(row_means, threshold, args.min_gap, args.max_gap)
 
     if args.verbose:
         print(f"  [DEBUG] Gaps: {len(gaps)}")
@@ -617,6 +636,10 @@ def process_file(
             print(f"  [DEBUG]   gap {i}: y=[{g.y_start}:{g.y_end}] h={g.height}px")
 
     frames = gaps_to_frames(gaps, H, args.min_frame)
+
+    if not args.no_holder_trim:
+        row_stds = compute_row_stds(gray, trim_fraction=EDGE_TRIM_FRACTION)
+        frames = trim_holder_edges(frames, row_means, row_stds, args.min_frame)
 
     if args.verbose:
         print(f"  [DEBUG] Frames: {len(frames)}")
@@ -630,8 +653,19 @@ def process_file(
         )
         return result
 
-    no_crop = args.no_crop_sprockets or (args.format == "120")
-    crop_box = detect_sprocket_crop(gray, gaps, no_crop, args.verbose)
+    # Warn when very few frames are found in a long strip — this usually means
+    # the inter-frame gaps are lighter than the default threshold captures.
+    # Typical case: scans where the film base between frames sits at ~25-35 instead
+    # of near-black (~4-8).  Running with --threshold 36 often fixes this.
+    if len(frames) <= 2 and H > 15000 and args.threshold is None:
+        result.warnings.append(
+            f"Only {len(frames)} frame(s) detected in a {H}px tall strip "
+            f"(threshold={threshold:.1f}). "
+            "Inter-frame gaps may be lighter than the default cap. "
+            "Try --threshold 36 (and --max-gap 750 if over-detection persists) for this file."
+        )
+
+    crop_box = CropBox(x_left=0, x_right=W, method="full")
     result.crop_box = crop_box
     result.frames = frames
     result.n_frames = len(frames)
@@ -652,7 +686,7 @@ def process_file(
         return result
 
     if transposed:
-        pil_image = pil_image.transpose(Image.TRANSPOSE)
+        pil_image = pil_image.transpose(Image.Transpose.TRANSPOSE)
 
     export_frames(pil_image, frames, crop_box, output_dir, filepath.stem, args.verbose,
                   frame_trim=args.frame_trim)
@@ -665,7 +699,7 @@ def process_file(
 # Summary and main
 # ---------------------------------------------------------------------------
 
-def print_file_summary(result: ProcessingResult, verbose: bool) -> None:
+def print_file_summary(result: ProcessingResult) -> None:
     name = result.filepath.name
 
     if result.n_frames == 0:
@@ -673,14 +707,10 @@ def print_file_summary(result: ProcessingResult, verbose: bool) -> None:
             print(f"{name} → WARNING: {w}")
         return
 
-    cb = result.crop_box
-    crop_str = f", crop={cb.method} x[{cb.x_left}:{cb.x_right}]" if cb else ""
-    print(f"{name} → {result.n_frames} frame(s)  "
-          f"[threshold={result.threshold_used:.1f}{crop_str}]")
+    print(f"{name} → {result.n_frames} frame(s)  [threshold={result.threshold_used:.1f}]")
 
-    if verbose:
-        for w in result.warnings:
-            print(f"  [WARN] {w}")
+    for w in result.warnings:
+        print(f"  [WARN] {w}")
 
 
 def main() -> None:
@@ -716,7 +746,7 @@ def main() -> None:
             print(f"Processing: {filepath.name}")
 
         result = process_file(filepath, output_dir, args)
-        print_file_summary(result, args.verbose)
+        print_file_summary(result)
 
         if result.n_frames == 0:
             skipped += 1
