@@ -35,9 +35,9 @@ Image.MAX_IMAGE_PIXELS = None   # scans legitimately exceed Pillow's decompressi
 # ---------------------------------------------------------------------------
 
 DEFAULT_MIN_GAP_PX = 10
-DEFAULT_MIN_FRAME_PX = 600
+DEFAULT_MIN_FRAME_PX = 1800
 DEFAULT_EXTENSIONS = ["tif", "tiff", "jpg", "jpeg", "png"]
-DEFAULT_GAP_THRESHOLD = 8       # max auto-threshold: real inter-frame borders are near-black (<10)
+DEFAULT_GAP_THRESHOLD = 12       # max auto-threshold: real inter-frame borders are near-black (<10)
                                  # keeping this tight avoids misclassifying dark frame content as gaps
 EDGE_TRIM_FRACTION = 0.155       # trim this fraction from each column edge before computing row means;
                                  # excludes bright holder/film-edge artefacts that skew gap detection
