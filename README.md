@@ -65,7 +65,7 @@ These control how the script finds the dark bands between frames.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--min-frame INT` | `300` | Minimum frame height in pixels. Regions shorter than this (partial leading/trailing fragments) are silently discarded. Raise to a larger value (e.g. `1000`) if you want to keep only full-sized frames. |
+| `--min-frame INT` | `1800` | Minimum frame height in pixels. Regions shorter than this (partial leading/trailing fragments) are silently discarded. Raise to a larger value if you want to keep only full-sized frames; lower it (e.g. `600`) if partial frames at the roll edges are being dropped. |
 | `--frame-trim INT` | `0` | Pixels to remove from the **top and bottom** of every exported frame. Use this to strip the film rebate (the thin dark border around each image area). |
 
 ---
@@ -87,7 +87,7 @@ removes this area.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--dry-run` | off | Prints the detected frames and their pixel coordinates without writing any files. **Always run this first** to check the result before a full export. |
-| `-v` / `--verbose` | off | Prints per-gap and per-frame debug numbers (threshold used, gap heights, frame heights). Most useful combined with `--dry-run` to diagnose a problem file. |
+| `-v` / `--verbose` | off | Prints per-gap and per-frame debug numbers (threshold used, gap heights and `dark_frac` range, frame heights). Most useful combined with `--dry-run` to diagnose a problem file. The `dark_frac` value shows what fraction of pixels in a gap are consistently dark across the full width — values near 1.00 are solid film base; values near 0.80 indicate a narrower or slightly uneven gap. |
 
 ---
 

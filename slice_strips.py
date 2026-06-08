@@ -39,6 +39,11 @@ DEFAULT_MIN_FRAME_PX = 1800
 DEFAULT_EXTENSIONS = ["tif", "tiff", "jpg", "jpeg", "png"]
 DEFAULT_GAP_THRESHOLD = 12       # max auto-threshold: real inter-frame borders are near-black (<10)
                                  # keeping this tight avoids misclassifying dark frame content as gaps
+MIN_GAP_DARK_FRACTION = 0.80     # ≥80% of trimmed-row pixels must be "dark" to count as a gap;
+                                 # rejects photo rows with a single dark corner that drag the mean down
+DARK_PIXEL_MULTIPLIER = 2.5      # pixel threshold for the dark-fraction test = threshold × this value;
+                                 # e.g., at default threshold=12 → test pixels < 30, so slightly-lifted
+                                 # film-base (mean=15-20) still qualifies while bright photo rows don't
 EDGE_TRIM_FRACTION = 0.155       # trim this fraction from each column edge before computing row means;
                                  # excludes bright holder/film-edge artefacts that skew gap detection
 
@@ -282,6 +287,21 @@ def compute_row_stds(gray: np.ndarray, trim_fraction: float = 0.0) -> np.ndarray
     return gray.std(axis=1)
 
 
+def compute_row_dark_fractions(
+    gray: np.ndarray,
+    threshold: float,
+    trim_fraction: float = 0.0,
+) -> np.ndarray:
+    """Fraction of pixels per row that are below threshold, shape (H,). Applies same column trim."""
+    if trim_fraction > 0:
+        W = gray.shape[1]
+        x0 = int(W * trim_fraction)
+        x1 = W - x0
+        if x1 > x0:
+            return (gray[:, x0:x1] < threshold).mean(axis=1)
+    return (gray < threshold).mean(axis=1)
+
+
 def auto_threshold(row_means: np.ndarray) -> float:
     """
     1-D Otsu threshold on the row_means distribution.
@@ -352,10 +372,59 @@ def detect_gaps(
     threshold: float,
     min_gap_px: int,
     max_gap_px: Optional[int] = None,
+    gray: Optional[np.ndarray] = None,
 ) -> List[GapRegion]:
     """Find inter-frame gaps; refine wide gaps caused by dark photographic content."""
+    # Pass 1: mean-based detection (original behavior).
     gaps = _find_gap_runs(row_means, threshold, min_gap_px)
+
     image_height = len(row_means)
+
+    # Pass 2: dark-fraction supplement — catch narrow gaps whose row mean is slightly
+    # above threshold because one photo corner is bright.  Only gaps that are (a) small
+    # enough to be a real film-base strip, (b) do not overlap any mean-detected gap, and
+    # (c) produce frames on both sides that are at least 75% of the typical frame height.
+    # The size cap and the frame-height guard together prevent false cuts inside dark photos.
+    if gray is not None:
+        # Derive typical frame height from pass-1 inter-gap intervals (≥ min-frame only,
+        # to exclude tiny leading/trailing edges).
+        _prev = -1
+        _p1_heights: List[int] = []
+        for _g in gaps:
+            _h = _g.y_start - _prev - 1
+            if _h >= DEFAULT_MIN_FRAME_PX:
+                _p1_heights.append(_h)
+            _prev = _g.y_end
+        _tail = image_height - _prev - 1
+        if _tail >= DEFAULT_MIN_FRAME_PX:
+            _p1_heights.append(_tail)
+        _pass1_median = float(np.median(_p1_heights)) if _p1_heights else float(DEFAULT_MIN_FRAME_PX)
+        _min_candidate_frame_h = _pass1_median * 0.75
+
+        dark_fracs = compute_row_dark_fractions(
+            gray, threshold * DARK_PIXEL_MULTIPLIER, trim_fraction=EDGE_TRIM_FRACTION,
+        )
+        is_dark_gap = dark_fracs >= MIN_GAP_DARK_FRACTION
+        padded = np.concatenate([[False], is_dark_gap, [False]])
+        df_edges = np.diff(padded.astype(np.int32))
+        df_starts = np.where(df_edges == 1)[0]
+        df_ends = np.where(df_edges == -1)[0]
+        _MAX_SUPPLEMENT_GAP = min_gap_px * 15  # e.g., ≤150px at default min_gap=10
+        for s, e in zip(df_starts, df_ends):
+            cand = GapRegion(int(s), int(e) - 1)
+            if cand.height < min_gap_px or cand.height > _MAX_SUPPLEMENT_GAP:
+                continue
+            # Skip candidates that overlap an already-detected gap.
+            if any(cand.y_start <= g.y_end and cand.y_end >= g.y_start for g in gaps):
+                continue
+            # Reject if either resulting frame would be too small vs. typical frame height.
+            _prev_end = max((g.y_end for g in gaps if g.y_end < cand.y_start), default=-1)
+            _next_start = min((g.y_start for g in gaps if g.y_start > cand.y_end), default=image_height)
+            if (cand.y_start - _prev_end - 1 < _min_candidate_frame_h
+                    or _next_start - cand.y_end - 1 < _min_candidate_frame_h):
+                continue
+            gaps.append(cand)
+        gaps.sort(key=lambda g: g.y_start)
 
     _LARGE_GAP_FACTOR = 4         # gaps > 4 × min_gap_px are candidates for refinement
     strict_threshold = threshold / 3.0  # ~12 at default threshold=36; catches film-base only
@@ -628,12 +697,18 @@ def process_file(
               f"max={row_means.max():.1f}, mean={row_means.mean():.1f}")
         print(f"  [DEBUG] Threshold: {threshold:.1f} ({src})")
 
-    gaps = detect_gaps(row_means, threshold, args.min_gap, args.max_gap)
+    gaps = detect_gaps(row_means, threshold, args.min_gap, args.max_gap, gray=gray)
 
     if args.verbose:
+        dark_fracs = compute_row_dark_fractions(
+            gray, threshold * DARK_PIXEL_MULTIPLIER, trim_fraction=EDGE_TRIM_FRACTION,
+        )
         print(f"  [DEBUG] Gaps: {len(gaps)}")
         for i, g in enumerate(gaps):
-            print(f"  [DEBUG]   gap {i}: y=[{g.y_start}:{g.y_end}] h={g.height}px")
+            frac_min = dark_fracs[g.y_start:g.y_end + 1].min()
+            frac_max = dark_fracs[g.y_start:g.y_end + 1].max()
+            print(f"  [DEBUG]   gap {i}: y=[{g.y_start}:{g.y_end}] h={g.height}px "
+                  f"dark_frac=[{frac_min:.2f}..{frac_max:.2f}]")
 
     frames = gaps_to_frames(gaps, H, args.min_frame)
 
