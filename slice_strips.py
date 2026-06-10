@@ -37,10 +37,11 @@ Image.MAX_IMAGE_PIXELS = None   # scans legitimately exceed Pillow's decompressi
 DEFAULT_MIN_GAP_PX = 10
 DEFAULT_MIN_FRAME_PX = 1800
 DEFAULT_EXTENSIONS = ["tif", "tiff", "jpg", "jpeg", "png"]
-DEFAULT_GAP_THRESHOLD = 12       # max auto-threshold: real inter-frame borders are near-black (<10)
-                                 # keeping this tight avoids misclassifying dark frame content as gaps
+DEFAULT_GAP_THRESHOLD = 12       # conservative cap for auto-threshold: near-black film base (<10)
+_AUTO_THRESHOLD_HARD_CAP = 80    # absolute ceiling — Otsu is never trusted above this value
 MIN_GAP_DARK_FRACTION = 0.80     # ≥80% of trimmed-row pixels must be "dark" to count as a gap;
                                  # rejects photo rows with a single dark corner that drag the mean down
+_BRIGHT_GAP_FRACTION = 0.95      # stricter bar for the bright-supplement pass (Pass 2b)
 DARK_PIXEL_MULTIPLIER = 2.5      # pixel threshold for the dark-fraction test = threshold × this value;
                                  # e.g., at default threshold=12 → test pixels < 30, so slightly-lifted
                                  # film-base (mean=15-20) still qualifies while bright photo rows don't
@@ -336,14 +337,14 @@ def auto_threshold(row_means: np.ndarray) -> float:
             best_var = var_b
             best_t = t
 
-    # Unimodality: fall back to 25th percentile
+    # Unimodality: fall back to 25th percentile (conservative cap applies here)
     total_var = float(np.var(scaled))
     if total_var > 0 and best_var < 0.01 * total_var:
         return min(float(np.percentile(row_means, 25)), DEFAULT_GAP_THRESHOLD)
 
-    # Convert bin index back to original value scale; cap to avoid misclassifying
-    # dark frame content as inter-frame gap (sprocket-zone brightness inflates Otsu)
-    return min(float(best_t) / 255.0 * (vmax - vmin) + vmin, DEFAULT_GAP_THRESHOLD)
+    # Return the raw Otsu value (caller applies the conservative cap).
+    # Hard ceiling prevents runaway results on pathological distributions.
+    return min(float(best_t) / 255.0 * (vmax - vmin) + vmin, _AUTO_THRESHOLD_HARD_CAP)
 
 
 def _find_gap_runs(
@@ -373,6 +374,7 @@ def detect_gaps(
     min_gap_px: int,
     max_gap_px: Optional[int] = None,
     gray: Optional[np.ndarray] = None,
+    supplement_threshold: Optional[float] = None,
 ) -> List[GapRegion]:
     """Find inter-frame gaps; refine wide gaps caused by dark photographic content."""
     # Pass 1: mean-based detection (original behavior).
@@ -395,9 +397,9 @@ def detect_gaps(
             if _h >= DEFAULT_MIN_FRAME_PX:
                 _p1_heights.append(_h)
             _prev = _g.y_end
-        _tail = image_height - _prev - 1
-        if _tail >= DEFAULT_MIN_FRAME_PX:
-            _p1_heights.append(_tail)
+        # Deliberately exclude the trailing frame: when gaps=[] _tail equals the full
+        # image height, which would inflate _pass1_median and make the frame-height
+        # guard impossibly strict, causing Pass 2 to reject all real gap candidates.
         _pass1_median = float(np.median(_p1_heights)) if _p1_heights else float(DEFAULT_MIN_FRAME_PX)
         _min_candidate_frame_h = _pass1_median * 0.75
 
@@ -409,7 +411,10 @@ def detect_gaps(
         df_edges = np.diff(padded.astype(np.int32))
         df_starts = np.where(df_edges == 1)[0]
         df_ends = np.where(df_edges == -1)[0]
-        _MAX_SUPPLEMENT_GAP = min_gap_px * 15  # e.g., ≤150px at default min_gap=10
+        # Scale cap with typical frame height so high-DPI scans (where a 2 mm gap
+        # can exceed 200 px) are not silently rejected; frame-height guard is the
+        # real safety net against false cuts inside dark photo content.
+        _MAX_SUPPLEMENT_GAP = max(min_gap_px * 15, int(_pass1_median * 0.25))
         for s, e in zip(df_starts, df_ends):
             cand = GapRegion(int(s), int(e) - 1)
             if cand.height < min_gap_px or cand.height > _MAX_SUPPLEMENT_GAP:
@@ -418,6 +423,38 @@ def detect_gaps(
             if any(cand.y_start <= g.y_end and cand.y_end >= g.y_start for g in gaps):
                 continue
             # Reject if either resulting frame would be too small vs. typical frame height.
+            _prev_end = max((g.y_end for g in gaps if g.y_end < cand.y_start), default=-1)
+            _next_start = min((g.y_start for g in gaps if g.y_start > cand.y_end), default=image_height)
+            if (cand.y_start - _prev_end - 1 < _min_candidate_frame_h
+                    or _next_start - cand.y_end - 1 < _min_candidate_frame_h):
+                continue
+            gaps.append(cand)
+        gaps.sort(key=lambda g: g.y_start)
+
+    # Pass 2b: bright-gap supplement — catches film base whose intrinsic brightness
+    # sits above threshold × DARK_PIXEL_MULTIPLIER (the Pass 2 pixel ceiling).
+    # Uses the uncapped Otsu value as the pixel test with a stricter fraction
+    # requirement (95%) so that only very uniform rows (true film base) qualify.
+    # The same size cap and frame-height guards as Pass 2 prevent false cuts inside
+    # dark photographic content.
+    if (gray is not None
+            and supplement_threshold is not None
+            and supplement_threshold > threshold * DARK_PIXEL_MULTIPLIER):
+        bright_fracs = compute_row_dark_fractions(
+            gray, supplement_threshold, trim_fraction=EDGE_TRIM_FRACTION,
+        )
+        is_bright_gap = bright_fracs >= _BRIGHT_GAP_FRACTION
+        padded_b = np.concatenate([[False], is_bright_gap, [False]])
+        b_edges = np.diff(padded_b.astype(np.int32))
+        b_starts = np.where(b_edges == 1)[0]
+        b_ends = np.where(b_edges == -1)[0]
+        _MAX_BRIGHT_SUPPLEMENT_GAP = max(min_gap_px * 15, int(_pass1_median * 0.25))
+        for s, e in zip(b_starts, b_ends):
+            cand = GapRegion(int(s), int(e) - 1)
+            if cand.height < min_gap_px or cand.height > _MAX_BRIGHT_SUPPLEMENT_GAP:
+                continue
+            if any(cand.y_start <= g.y_end and cand.y_end >= g.y_start for g in gaps):
+                continue
             _prev_end = max((g.y_end for g in gaps if g.y_end < cand.y_start), default=-1)
             _next_start = min((g.y_start for g in gaps if g.y_start > cand.y_end), default=image_height)
             if (cand.y_start - _prev_end - 1 < _min_candidate_frame_h
@@ -687,17 +724,26 @@ def process_file(
 
     row_means = compute_row_means(gray, trim_fraction=EDGE_TRIM_FRACTION)
 
-    threshold = (float(args.threshold) if args.threshold is not None
-                 else auto_threshold(row_means))
+    if args.threshold is not None:
+        threshold = float(args.threshold)
+        raw_threshold = threshold          # user-supplied; no bright supplement needed
+    else:
+        raw_threshold = auto_threshold(row_means)                    # uncapped Otsu
+        threshold = min(raw_threshold, DEFAULT_GAP_THRESHOLD)        # conservative cap for Pass 1
     result.threshold_used = threshold
 
     if args.verbose:
         src = "user" if args.threshold is not None else "auto/Otsu"
         print(f"  [DEBUG] Row means: min={row_means.min():.1f}, "
               f"max={row_means.max():.1f}, mean={row_means.mean():.1f}")
-        print(f"  [DEBUG] Threshold: {threshold:.1f} ({src})")
+        if args.threshold is None and raw_threshold > DEFAULT_GAP_THRESHOLD:
+            print(f"  [DEBUG] Threshold: {threshold:.1f} ({src}; Otsu suggested "
+                  f"{raw_threshold:.1f}, capped — bright supplement active)")
+        else:
+            print(f"  [DEBUG] Threshold: {threshold:.1f} ({src})")
 
-    gaps = detect_gaps(row_means, threshold, args.min_gap, args.max_gap, gray=gray)
+    gaps = detect_gaps(row_means, threshold, args.min_gap, args.max_gap, gray=gray,
+                       supplement_threshold=raw_threshold)
 
     if args.verbose:
         dark_fracs = compute_row_dark_fractions(
